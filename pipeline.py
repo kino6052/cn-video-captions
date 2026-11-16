@@ -287,11 +287,28 @@ def stage_review(rows, reviewer):
     if not changed:
         return {"description": desc, "remaining": []}
     out = reviewer.ask(
-        "视频主题：" + desc + "\n\n修正后的字幕：\n"
+        "视频主题：" + desc + "\n\n字幕：\n"
         + "\n".join(f"{r['n']}|{r['text']}" for r in changed[:80])
-        + '\n\n只列出仍然不通顺或明显错误的行，JSON 数组 [{"n": 序号, "issue": "问题"}]，'
-          "全部通过输出 []。")
+        + "\n\n只报确实错误、会让读者看不懂或误解的行：同音错字、专有名词写错、"
+          "缺字导致不成句。这是口语字幕，口语、重复、短句都不算错。\n"
+          "不要润色、不要改语序、不要改成书面语、不要因为标点或风格而报错。\n"
+          '严格输出 JSON 数组 [{"n": 序号, "issue": "问题", "fix": "最小改动"}]；'
+          "fix 只能替换个别词，必须保持原句结构与长度，不得增删分句。全部通过输出 []。")
     remaining = [x for x in parse_list(out) if isinstance(x, dict)]
+    # structure guard: reject any suggestion that rewrites rather than repairs
+    kept = []
+    for x in remaining:
+        fix = str(x.get("fix", "")).strip()
+        if not fix:
+            kept.append(x)
+            continue
+        src = next((r["text"] for r in changed if str(r["n"]) == str(x.get("n"))), "")
+        ratio = len(fix) / max(1, len(src))
+        if 0.7 <= ratio <= 1.3 and sim(fix, src) >= 0.5:
+            kept.append(x)
+        else:
+            log(f"E review: dropped a structural rewrite at cue {x.get('n')}")
+    remaining = kept
     log(f"E review: {len(remaining)} left")
     return {"description": desc, "remaining": remaining}
 
