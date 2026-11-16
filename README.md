@@ -27,7 +27,7 @@ consults the screen only for the lines audio is unsure about.
 | **C. Screen** | OCR only flagged lines, one mid-line frame each | ~1.3 s per line vs 0.5 s × 688 frames |
 | **D. Merge** | character-level diff: **substitutions** from screen, **deletions** kept from audio | screen fixes `铃铛→灵感`, audio keeps the `想都` the screen dropped |
 | **D2. Re-hear** | `whisper medium` on the flagged cues only | fixes what both small models and OCR get wrong (`Exile/Excele → Excel`) |
-| **E. Review** | LLM reads the changed lines, proposes fixes | advisory only, never auto-applied |
+| **E. Review** | LLM reads the changed lines, proposes fixes | advisory only, never applied; told to report real errors only (no polishing, no reordering) and a code guard drops any rewrite that leaves the 0.7–1.3 length band |
 
 Flagging is naturally sparse (~9% of cues), which is what keeps the whole thing inside 4 minutes.
 
