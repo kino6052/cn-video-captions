@@ -101,6 +101,21 @@ The bundled example is under [`examples/`](examples/).
 - The LLM reviewer is opinionated — it flags stylistic choices as errors. Treat `report.md` as advice
 - Tuned on 1080p Mandarin talking-head + screen-recording content; Cantonese and vertical video are untested
 
+
+## Lessons from building it
+
+Each of these cost real time; the number next to it is how we knew.
+
+1. **Audio first, screen second.** OCR every frame was ~30 min and picked up page text; audio was 1.5 min and never misread pixels. The cheap modality should be the backbone.
+2. **Segment-level confidence is useless, word-level is gold.** `avg_logprob` was −0.16 on a cue containing the badly wrong `鋼` (p=0.26). Per-word probability found every real error; the segment score found none.
+3. **Merge characters, not lines.** The screen dropped `想都` while fixing `铃铛→灵感`. Line replacement loses one to gain the other; a char-level diff keeps both.
+4. **Spend the expensive model only on suspects.** `medium` on 7 flagged cues (50 s) fixed 2/2 of the remaining errors. On all 78 cues it would have cost 6 minutes for the same two fixes.
+5. **Reasoning models are slow for translation.** `reasoning_effort: "none"` took a call from 3.7 s to 1.3 s with identical output; parallel chunks made the whole transcript 3.7 s.
+6. **Check CPU-vs-wall before optimising.** An "audio-only" run took 110 s wall and **1.2 s CPU** — it was blocked on an unreachable `huggingface.co`, not computing. `HF_ENDPOINT` fixed it; no algorithm change would have.
+7. **Prompts need a scope guard, and so does code.** "Report errors" became "rewrite sentences" until the prompt forbade polishing *and* a length/similarity check dropped rewrites anyway. Models drift; make the invariant executable.
+8. **A threshold that never changes the output is not a knob.** 0.35 and 0.45 produced byte-identical transcripts — keep the cheaper one.
+9. **Gated endpoints fail transparently if you probe them properly.** 小宇宙's transcripts are real (5/5 episodes) but every path returns the same 401 and the CDN has no sidecar. Ten minutes of probing beat hours of scraping.
+
 ## License
 
 MIT
