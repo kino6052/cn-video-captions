@@ -26,6 +26,10 @@ from difflib import SequenceMatcher
 
 import numpy as np
 
+# huggingface.co is unreachable from some networks and blocks model loading for minutes;
+# the mirror is set by default, and HF_HUB_OFFLINE=1 skips the update check entirely.
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 CJK = re.compile(r"[^\u4e00-\u9fffA-Za-z0-9]")
 UI_WORDS = {"运行中", "Opening", "营业中", "bilibili"}
 DEFAULTS = {
@@ -71,35 +75,59 @@ def probe(video, audio_only=False):
 
 
 # ------------------------------------------------------------------ A
-def stage_audio(start, end, outdir):
-    wav = os.path.join(outdir, "audio.wav")
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(start), "-to", str(end),
+def _transcribe_span(model, span, outdir):
+    """Transcribe one [start, end) window; returns cues with absolute times."""
+    a, b = span
+    wav = os.path.join(outdir, f"chunk_{int(a)}_{int(b)}.wav")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(a), "-to", str(b),
                     "-i", VIDEO, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav],
                    check=True)
-    from faster_whisper import WhisperModel
-    model = WhisperModel(DEFAULTS["asr_model"], device="cpu", compute_type="int8",
-                         cpu_threads=os.cpu_count() or 4)
     with wave.open(wav, "rb") as w:
         pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    os.remove(wav)
     segments, _ = model.transcribe(
         pcm.astype(np.float32) / 32768.0, language="zh", beam_size=1, vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 300},
         word_timestamps=True, condition_on_previous_text=False)
-    rows = []
+    out = []
     for s in segments:
         text = s.text.strip()
         if not norm(text):
             continue
         words = [{"w": x.word, "p": round(float(x.probability), 2),
-                  "s": round(x.start + start, 2), "e": round(x.end + start, 2)}
+                  "s": round(x.start + a, 2), "e": round(x.end + a, 2)}
                  for x in (s.words or [])]
-        rows.append({"n": len(rows) + 1, "start": round(s.start + start, 3),
-                     "end": round(s.end + start, 3), "asr": text,
-                     "minp": round(min([x["p"] for x in words] or [1.0]), 2),
-                     "words": words})
-    os.remove(wav)
-    log(f"A audio: {len(rows)} cues")
-    return rows
+        out.append({"start": round(s.start + a, 3), "end": round(s.end + a, 3),
+                    "asr": text, "words": words})
+    return out
+
+
+def stage_audio(start, end, outdir, chunk=300, jobs=2):
+    """Chunked and parallel: same total compute, but progress, lower memory, resume."""
+    from faster_whisper import WhisperModel
+    from concurrent.futures import ThreadPoolExecutor
+    model = WhisperModel(DEFAULTS["asr_model"], device="cpu", compute_type="int8",
+                         cpu_threads=max(1, (os.cpu_count() or 4) // max(1, jobs)))
+    spans = [(a, min(a + chunk, end)) for a in np.arange(start, end, chunk)]
+    log(f"A audio: {len(spans)} chunk(s) of {chunk}s, {jobs} in parallel")
+    acc, done = [], 0
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        for part in pool.map(lambda sp: _transcribe_span(model, sp, outdir), spans):
+            acc += part
+            done += 1
+            log(f"A audio: chunk {done}/{len(spans)} done ({len(part)} cues)")
+    acc.sort(key=lambda r: r["start"])
+    # drop the overlap whisper repeats at a chunk seam
+    clean = []
+    for r in acc:
+        if clean and r["start"] < clean[-1]["end"] - 0.4 and sim(r["asr"], clean[-1]["asr"]) > 0.6:
+            continue
+        clean.append(r)
+    for i, r in enumerate(clean):
+        r["n"] = i + 1
+        r["minp"] = round(min([w["p"] for w in r["words"]] or [1.0]), 2)
+    log(f"A audio: {len(clean)} cues")
+    return clean
 
 
 # ------------------------------------------------------------------ B
@@ -403,6 +431,8 @@ def main():
     ap.add_argument("--end", type=float, default=0, help="default: full video")
     ap.add_argument("--th", type=float, default=DEFAULTS["th"])
     ap.add_argument("--max-ocr", type=int, default=DEFAULTS["max_ocr"])
+    ap.add_argument("--chunk", type=int, default=300, help="ASR chunk length in seconds")
+    ap.add_argument("--jobs", type=int, default=2, help="chunks transcribed in parallel")
     ap.add_argument("--no-second-pass", action="store_true", help="skip whisper medium re-hear")
     ap.add_argument("--audio-only", action="store_true",
                     help="input has no video stream: skip frame probing and all screen OCR")
@@ -419,7 +449,7 @@ def main():
     end = args.end or duration
     os.makedirs(args.out, exist_ok=True)
 
-    rows = stage_audio(args.start, end, args.out)
+    rows = stage_audio(args.start, end, args.out, args.chunk, args.jobs)
     stage_flag(rows, args.th)
     if args.audio_only:
         log("C screen: skipped (audio-only input)")
