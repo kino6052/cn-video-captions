@@ -57,7 +57,12 @@ def sim(a, b):
     return SequenceMatcher(None, a, b).ratio() if a and b else 0.0
 
 
-def probe(video):
+def probe(video, audio_only=False):
+    """Frame size and duration. Audio-only input has no video stream to measure."""
+    if audio_only:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "json", video], capture_output=True, text=True).stdout
+        return 0, 0, float(json.loads(out)["format"]["duration"])
     out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
                           "-show_entries", "stream=width,height,duration",
                           "-of", "json", video], capture_output=True, text=True).stdout
@@ -313,6 +318,36 @@ def stage_review(rows, reviewer):
     return {"description": desc, "remaining": remaining}
 
 
+# ------------------------------------------------------------------ T
+def to_pinyin(text):
+    from pypinyin import pinyin, Style
+    return " ".join(syllable[0] for syllable in pinyin(text, style=Style.TONE))
+
+
+def stage_triple(rows, reviewer, chunk=30):
+    """Chinese (already there) + pinyin (local) + English (LLM, batched)."""
+    for r in rows:
+        r["pinyin"] = to_pinyin(r["text"])
+    if reviewer.on:
+        for c0 in range(0, len(rows), chunk):
+            part = rows[c0:c0 + chunk]
+            out = reviewer.ask(
+                "把下面的中文字幕逐条翻成英文：自然、忠实原文、不增不减，不要解释，不要合并句子。\n"
+                + "\n".join(f"{r['n']}|{r['text']}" for r in part)
+                + '\n\n只输出 JSON 数组 [{"n": 序号, "en": "英文"}]。')
+            for item in parse_list(out):
+                if not isinstance(item, dict):
+                    continue
+                n = str(item.get("n", "")).strip()
+                hit = next((r for r in part if str(r["n"]) == n), None)
+                if hit:
+                    hit["en"] = str(item.get("en", "")).strip()
+    for r in rows:
+        r.setdefault("en", "")
+    log(f"T triple: pinyin for {len(rows)} cues, "
+        f"english for {sum(1 for r in rows if r['en'])}")
+
+
 # ------------------------------------------------------------------ F
 def ts(x):
     h, m, s = int(x // 3600), int(x % 3600 // 60), x % 60
@@ -323,14 +358,18 @@ def emit(rows, review, outdir, video):
     rows.sort(key=lambda r: r["start"])
     for n, r in enumerate(rows, 1):
         r["n"] = n
+    tripled = any(r.get("pinyin") for r in rows)
     with open(os.path.join(outdir, "fused.srt"), "w", encoding="utf-8") as fh:
         for r in rows:
+            body = r["text"]
+            if tripled:
+                body += "\n" + r.get("pinyin", "") + "\n" + r.get("en", "")
             fh.write(f"{r['n']}\n{ts(r['start'])} --> {ts(max(r['end'], r['start'] + 0.4))}\n"
-                     f"{r['text']}\n\n")
+                     f"{body}\n\n")
     json.dump({"video": video, "description": review["description"],
-               "cues": [{k: r.get(k) for k in ("n", "start", "end", "text", "asr", "asr2",
-                                               "base", "status", "minp", "ocr", "ocr_sc",
-                                               "flag", "words")} for r in rows],
+               "cues": [{k: r.get(k) for k in ("n", "start", "end", "text", "pinyin", "en",
+                                               "asr", "asr2", "base", "status", "minp",
+                                               "ocr", "ocr_sc", "flag", "words")} for r in rows],
                "remaining": review["remaining"]},
               open(os.path.join(outdir, "transcript.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=1)
@@ -364,6 +403,10 @@ def main():
     ap.add_argument("--th", type=float, default=DEFAULTS["th"])
     ap.add_argument("--max-ocr", type=int, default=DEFAULTS["max_ocr"])
     ap.add_argument("--no-second-pass", action="store_true", help="skip whisper medium re-hear")
+    ap.add_argument("--audio-only", action="store_true",
+                    help="input has no video stream: skip frame probing and all screen OCR")
+    ap.add_argument("--triple", action="store_true",
+                    help="each cue also gets pinyin (local) and English (LLM)")
     ap.add_argument("--no-llm", action="store_true")
     ap.add_argument("--llm-base", default=None, help="OpenAI-compatible base URL")
     ap.add_argument("--llm-model", default=None)
@@ -371,20 +414,28 @@ def main():
 
     global VIDEO, W, H
     VIDEO = os.path.abspath(args.video)
-    W, H, duration = probe(VIDEO)
+    W, H, duration = probe(VIDEO, audio_only=args.audio_only)
     end = args.end or duration
     os.makedirs(args.out, exist_ok=True)
 
     rows = stage_audio(args.start, end, args.out)
     stage_flag(rows, args.th)
-    stage_screen(rows, Screen(), args.max_ocr)
-    stage_fuse(rows)
+    if args.audio_only:
+        log("C screen: skipped (audio-only input)")
+        for r in rows:
+            r["flag"] = []
+        stage_fuse(rows)
+    else:
+        stage_screen(rows, Screen(), args.max_ocr)
+        stage_fuse(rows)
     if not args.no_second_pass:
         rows = stage_second_asr(rows, args.out)
         stage_fuse2(rows)
     reviewer = Reviewer(base=args.llm_base, model=args.llm_model)
     if args.no_llm:
         reviewer.on = False
+    if args.triple:
+        stage_triple(rows, reviewer)
     emit(rows, stage_review(rows, reviewer), args.out, VIDEO)
 
 
