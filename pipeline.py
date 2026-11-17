@@ -232,9 +232,15 @@ def stage_fuse(rows):
 
 
 # ------------------------------------------------------------------ D2
-def stage_second_asr(rows, outdir):
-    """Re-hear the suspects with a stronger model: a third opinion on the words."""
-    need = [r for r in rows if r["flag"]]
+def stage_second_asr(rows, outdir, cap=60):
+    """Re-hear the suspects with a stronger model: a third opinion on the words.
+
+    Capped: on long audio the suspect list runs to hundreds of cues and medium
+    costs ~6s each, which silently turns a 10 minute episode into an hour.
+    """
+    need = sorted([r for r in rows if r["flag"]], key=lambda r: r["minp"])[:cap]
+    if len(need) < sum(1 for r in rows if r["flag"]):
+        log(f"D2: capping re-hear at {len(need)} lowest-confidence cues")
     if not need:
         return rows
     from faster_whisper import WhisperModel
@@ -433,6 +439,8 @@ def main():
     ap.add_argument("--max-ocr", type=int, default=DEFAULTS["max_ocr"])
     ap.add_argument("--chunk", type=int, default=300, help="ASR chunk length in seconds")
     ap.add_argument("--jobs", type=int, default=2, help="chunks transcribed in parallel")
+    ap.add_argument("--max-reread", type=int, default=60,
+                    help="cap on cues re-heard with the medium model")
     ap.add_argument("--no-second-pass", action="store_true", help="skip whisper medium re-hear")
     ap.add_argument("--audio-only", action="store_true",
                     help="input has no video stream: skip frame probing and all screen OCR")
@@ -452,15 +460,16 @@ def main():
     rows = stage_audio(args.start, end, args.out, args.chunk, args.jobs)
     stage_flag(rows, args.th)
     if args.audio_only:
+        # no screen to consult, but keep the flags: they are what drives the medium re-hear
         log("C screen: skipped (audio-only input)")
         for r in rows:
-            r["flag"] = []
+            r["ocr"] = ""
         stage_fuse(rows)
     else:
         stage_screen(rows, Screen(), args.max_ocr)
         stage_fuse(rows)
     if not args.no_second_pass:
-        rows = stage_second_asr(rows, args.out)
+        rows = stage_second_asr(rows, args.out, args.max_reread)
         stage_fuse2(rows)
     reviewer = Reviewer(base=args.llm_base, model=args.llm_model)
     if args.no_llm:
