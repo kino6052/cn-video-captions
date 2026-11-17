@@ -256,7 +256,8 @@ class Reviewer:
         if not self.on:
             return ""
         body = json.dumps({"model": self.model, "temperature": 0,
-                           "messages": [{"role": "user", "content": prompt}]}).encode()
+                           "messages": [{"role": "user", "content": prompt}],
+                           "reasoning_effort": "none"}).encode()
         req = urllib.request.Request(f"{self.base}/chat/completions", data=body,
                                      headers={"Content-Type": "application/json",
                                               "Authorization": f"Bearer {self.key}"})
